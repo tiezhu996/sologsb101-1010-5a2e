@@ -15,6 +15,7 @@ import type { Component } from 'svelte'
 import BuildingList from './BuildingList.svelte'
 import DeviceList from './DeviceList.svelte'
 import PointEntry from './PointEntry.svelte'
+import BatchReconcile from './BatchReconcile.svelte'
 import VerdictBoard from './VerdictBoard.svelte'
 import BackupView from './BackupView.svelte'
 import HomeRedirect from './HomeRedirect.svelte'
@@ -39,6 +40,7 @@ export const routes: AppRoute[] = [
   { path: HOME_PATH, component: BuildingList as unknown as PageComponent },
   { path: '/devices', component: DeviceList as unknown as PageComponent },
   { path: '/points', component: PointEntry as unknown as PageComponent },
+  { path: '/batches', component: BatchReconcile as unknown as PageComponent },
   { path: '/verdicts', component: VerdictBoard as unknown as PageComponent },
   { path: '/backup', component: BackupView as unknown as PageComponent },
   { path: NOT_FOUND_PATH, component: NotFound as unknown as PageComponent }

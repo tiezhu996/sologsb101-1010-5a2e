@@ -15,6 +15,10 @@ export interface Point {
   meter: string
   /** 检测日期 */
   measureDate: string
+  /** 来源批次号（旧数据回填为初始批次，见 types/batch.ts） */
+  batchNo: string
+  /** 同一测点多条并列读数时的序号（1 为首录主值，>1 为同批次并列读数） */
+  readingOrdinal: number
   createdAt: number
   updatedAt: number
 }
@@ -38,49 +42,4 @@ export function createEmptyPointDraft(limitOhm = 10, meter = '', measureDate = '
     meter,
     measureDate: measureDate || new Date().toISOString().slice(0, 10)
   }
-}
-
-/** 批量粘贴解析出的一行测点草稿 */
-export interface PointPasteRow {
-  code: string
-  location: string
-  measuredOhm: number
-  limitOhm: number
-}
-
-/**
- * 解析批量粘贴文本：每行「测点编号,位置,实测电阻[,限值]」。
- * 逗号 / 制表符 / 分号均可作分隔，纯空格不定界（位置描述常含空格）。
- */
-export function parsePointPaste(text: string, defaultLimitOhm = 10): { rows: PointPasteRow[]; errors: string[] } {
-  const rows: PointPasteRow[] = []
-  const errors: string[] = []
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-  lines.forEach((line, index) => {
-    const cells = line.split(/[,，\t;；]+/).map((cell) => cell.trim())
-    if (cells.length < 3) {
-      errors.push(`第 ${index + 1} 行「${line}」至少需要「测点编号,位置,实测电阻」三列`)
-      return
-    }
-    const measuredOhm = Number(cells[2])
-    if (!Number.isFinite(measuredOhm) || measuredOhm < 0) {
-      errors.push(`第 ${index + 1} 行实测电阻应为非负数字`)
-      return
-    }
-    const limitOhm = cells.length >= 4 ? Number(cells[3]) : defaultLimitOhm
-    if (!Number.isFinite(limitOhm) || limitOhm <= 0) {
-      errors.push(`第 ${index + 1} 行限值应为大于 0 的数字`)
-      return
-    }
-    rows.push({
-      code: cells[0],
-      location: cells[1],
-      measuredOhm: Number(measuredOhm.toFixed(3)),
-      limitOhm: Number(limitOhm.toFixed(3))
-    })
-  })
-  return { rows, errors }
 }

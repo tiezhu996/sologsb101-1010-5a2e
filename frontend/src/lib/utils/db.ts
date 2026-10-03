@@ -14,10 +14,12 @@ import type { Verdict } from '$lib/types/verdict'
 import { defaultBasis, judgePoint } from '$lib/types/verdict'
 import type { Rectify } from '$lib/types/rectify'
 import { SUGGESTION_TEMPLATES } from '$lib/types/rectify'
+import type { Batch, Reading } from '$lib/types/batch'
+import { LEGACY_BATCH_ID, LEGACY_BATCH_NO, readingRowKey } from '$lib/types/batch'
 import { suggestLimitOhm } from '$lib/utils/resistance'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gblightprot'
@@ -39,6 +41,8 @@ export interface BackupPayload {
   points: Point[]
   verdicts: Verdict[]
   rectifies: Rectify[]
+  batches: Batch[]
+  readings: Reading[]
 }
 
 export class LightProtDatabase extends Dexie {
@@ -47,6 +51,8 @@ export class LightProtDatabase extends Dexie {
   points!: Table<Point, string>
   verdicts!: Table<Verdict, string>
   rectifies!: Table<Rectify, string>
+  batches!: Table<Batch, string>
+  readings!: Table<Reading, string>
 
   constructor() {
     super(DB_NAME)
@@ -61,16 +67,28 @@ export class LightProtDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（用途/类别/层数、装置类型、限值、判定与状态）
+    this.version(2).stores({
+      buildings: 'id, name, usage, protectionClass, floors, heightM, updatedAt',
+      devices: 'id, buildingId, type, material, spec, quantity, installDate, updatedAt',
+      points: 'id, deviceId, code, measuredOhm, limitOhm, measureDate, updatedAt',
+      verdicts: 'id, pointId, result, confirmed, verdictDate, updatedAt',
+      rectifies: 'id, buildingId, pointId, state, deadline, updatedAt'
+    })
+
+    // v3：批次对账——批次档案 + 批次读数留痕；测点挂批次号与并列序号；判定存确认时限值快照
     this.version(DB_VERSION)
       .stores({
         buildings: 'id, name, usage, protectionClass, floors, heightM, updatedAt',
         devices: 'id, buildingId, type, material, spec, quantity, installDate, updatedAt',
-        points: 'id, deviceId, code, measuredOhm, limitOhm, measureDate, updatedAt',
-        verdicts: 'id, pointId, result, confirmed, verdictDate, updatedAt',
-        rectifies: 'id, buildingId, pointId, state, deadline, updatedAt'
+        points: 'id, deviceId, code, measuredOhm, limitOhm, measureDate, updatedAt, batchNo, readingOrdinal',
+        verdicts: 'id, pointId, result, confirmed, verdictDate, updatedAt, limitOhm',
+        rectifies: 'id, buildingId, pointId, state, deadline, updatedAt',
+        batches: 'id, batchNo, status, createdAt, updatedAt',
+        readings:
+          'id, batchId, batchNo, rowOrder, code, deviceType, status, pointId, deviceId, rowKey'
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与判定确认标记，避免列表排序与筛选拿到 undefined
+        // 历史数据补齐缺失的时间戳与字段默认值；只补缺值，绝不覆盖 v2 已确认的结论
         const defaults: Array<[string, () => Record<string, unknown>]> = [
           ['buildings', () => ({ floors: 1, heightM: 4 })],
           ['devices', () => ({ quantity: 1, installDate: new Date().toISOString().slice(0, 10) })],
@@ -86,8 +104,99 @@ export class LightProtDatabase extends Dexie {
               const now = Date.now()
               if (typeof row.createdAt !== 'number') row.createdAt = now
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt
-              Object.assign(row, factory())
+              // 仅补字段缺失/空值：v2 已有数据（如已确认判定 confirmed:true）必须原样保留
+              for (const [key, value] of Object.entries(factory())) {
+                if (row[key] === undefined || row[key] === null || row[key] === '') row[key] = value
+              }
             })
+        }
+
+        // 迁移 v3：旧测点回填「初始批次」；判定补确认时限值快照
+        const legacyPoints = (await tx.table('points').toArray()) as Array<Record<string, unknown> & {
+          id: string
+          deviceId: string
+          code: string
+          location: string
+          measuredOhm: number
+          limitOhm: number
+          meter: string
+          measureDate: string
+          createdAt: number
+          updatedAt: number
+        }>
+        const legacyDevices = (await tx.table('devices').toArray()) as Device[]
+        const deviceById = new Map(legacyDevices.map((device) => [device.id, device]))
+        await tx
+          .table('points')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.batchNo !== 'string' || row.batchNo.length === 0) row.batchNo = LEGACY_BATCH_NO
+            if (typeof row.readingOrdinal !== 'number') row.readingOrdinal = 1
+          })
+        await tx
+          .table('verdicts')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.limitOhm !== 'number') {
+              const point = legacyPoints.find((item) => item.id === row.pointId)
+              row.limitOhm = point?.limitOhm ?? 10
+            }
+          })
+
+        // 旧数据没有批次来源：归入「初始批次」，并为每个旧测点补一条迁移读数，测点/判定/整改照旧可查
+        const existingBatch = await tx.table('batches').get(LEGACY_BATCH_ID)
+        if (!existingBatch) {
+          const now = Date.now()
+          await tx.table('batches').add({
+            id: LEGACY_BATCH_ID,
+            batchNo: LEGACY_BATCH_NO,
+            status: 'completed',
+            sourceName: '历史数据兼容回填',
+            meter: '',
+            measureDate: '',
+            totalRows: legacyPoints.length,
+            duplicatedRows: 0,
+            checkpointIndex: legacyPoints.length,
+            lastError: '',
+            buildingId: null,
+            note: '升级到批次对账结构时，无批次来源的旧测点、判定与整改建议均归入本批次，数据原样保留可查。',
+            createdAt: now,
+            updatedAt: now,
+            completedAt: now,
+            failedAt: null
+          } satisfies Batch)
+          const legacyReadings: Reading[] = legacyPoints.map((point, index) => {
+            const device = deviceById.get(point.deviceId)
+            const deviceType = (device?.type ?? '接地体') as Reading['deviceType']
+            return {
+              id: `rdg_legacy_${point.id}`,
+              batchId: LEGACY_BATCH_ID,
+              batchNo: LEGACY_BATCH_NO,
+              rowOrder: index,
+              rowKey: readingRowKey(LEGACY_BATCH_NO, {
+                code: point.code,
+                deviceType,
+                measuredOhm: point.measuredOhm,
+                limitOhm: point.limitOhm,
+                location: point.location
+              }),
+              code: point.code,
+              deviceType,
+              measuredOhm: point.measuredOhm,
+              limitOhm: point.limitOhm,
+              location: point.location,
+              meter: point.meter ?? '',
+              measureDate: point.measureDate ?? '',
+              status: 'attached',
+              action: 'migrated-legacy',
+              pointId: point.id,
+              deviceId: point.deviceId,
+              reason: '旧数据回填初始批次',
+              createdAt: point.createdAt ?? now,
+              updatedAt: point.updatedAt ?? now
+            }
+          })
+          if (legacyReadings.length > 0) await tx.table('readings').bulkAdd(legacyReadings)
         }
       })
   }
@@ -129,6 +238,8 @@ interface SeedPoint {
   limitOhm: number
   meter: string
   measureDate: string
+  /** 同测点多条并列读数时的序号（1 为首录，>1 为并列） */
+  readingOrdinal?: number
 }
 
 interface SeedDevice {
@@ -240,6 +351,18 @@ export async function seedDemoData(): Promise<void> {
           limitOhm: 10,
           meter: 'ZC-8 接地电阻测试仪 / No.20230517',
           measureDate: today
+        },
+        {
+          // 同一测点同批次的第二条实测读数：并列保留，不覆盖首录值与已确认判定
+          id: 'pnt_oil_down_2_r2',
+          deviceId: 'dev_oil_down',
+          code: 'JD-OIL-04',
+          location: '南侧 6 号引下线断接卡处（雨后复测）',
+          measuredOhm: 7.9,
+          limitOhm: 10,
+          meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+          measureDate: today,
+          readingOrdinal: 2
         }
       ]
     },
@@ -351,7 +474,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies],
+    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies, db.batches, db.readings],
     async () => {
       const stamp = (index: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + index,
@@ -366,7 +489,8 @@ export async function seedDemoData(): Promise<void> {
         const { points, ...rest } = device
         allDevices.push({ ...rest, ...stamp(index) })
         points.forEach((point, pointIndex) => {
-          allPoints.push({ ...point, ...stamp(index * 100 + pointIndex) })
+          const { readingOrdinal = 1, ...pointRest } = point
+          allPoints.push({ ...pointRest, ...stamp(index * 100 + pointIndex), batchNo: SEED_BATCH_NO, readingOrdinal })
         })
       })
       await db.devices.bulkPut(allDevices)
@@ -378,22 +502,26 @@ export async function seedDemoData(): Promise<void> {
       const verdicts: Verdict[] = allPoints.map((point, index) => {
         const device = deviceOfPoint.get(point.deviceId)
         const building = buildings.find((item) => item.id === buildingOfDevice.get(point.deviceId))
+        // 并列第二条读数初判不覆盖首录结论，仅留未确认记录，等待检测人在判定台处理
+        const confirmed = point.readingOrdinal === 1
         return {
           id: `vrd_${point.id}`,
           pointId: point.id,
           result: judgePoint(point.measuredOhm, point.limitOhm),
           basis: defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
+          // 记录确认当时所依据的限值，后续实测改写不影响已确认结论
+          limitOhm: point.limitOhm,
           inspector: '陈立群',
           verdictDate: point.measureDate,
-          confirmed: true,
+          confirmed,
           ...stamp(1000 + index)
         }
       })
       await db.verdicts.bulkPut(verdicts)
 
-      // 由不合格判定批量生成整改建议（跟踪到复检闭环）
+      // 由已确认的不合格判定批量生成整改建议（跟踪到复检闭环）
       const rectifies: Rectify[] = verdicts
-        .filter((verdict) => verdict.result === '不合格')
+        .filter((verdict) => verdict.confirmed && verdict.result === '不合格')
         .map((verdict, index) => {
           const point = allPoints.find((item) => item.id === verdict.pointId)
           const buildingId = point ? buildingOfDevice.get(point.deviceId) ?? '' : ''
@@ -430,8 +558,101 @@ export async function seedDemoData(): Promise<void> {
           ...stamp(3000)
         })
       }
+
+      // 批次对账演示：首录批次的读数全部挂接（含一条并列读数），并留一条待人工指派的读数
+      await seedBatchRecords(allPoints, allDevices, stamp)
     }
   )
+}
+
+/** 播种用的批次号（同一次外场检测） */
+const SEED_BATCH_NO = 'PC-20260928-01'
+
+/** 为演示数据补齐批次档案与读数留痕（含一条待人工指派的样本） */
+async function seedBatchRecords(
+  allPoints: Point[],
+  allDevices: Device[],
+  stamp: (index: number) => { createdAt: number; updatedAt: number }
+): Promise<void> {
+  const now = Date.now()
+  const actionOf = (point: Point): Reading['action'] => (point.readingOrdinal > 1 ? 'parallel-point' : 'matched-existing')
+  const attached: Reading[] = allPoints.map((point, index) => {
+    const device = allDevices.find((item) => item.id === point.deviceId)
+    return {
+      id: `rdg_seed_${point.id}`,
+      batchId: 'bat_seed01',
+      batchNo: SEED_BATCH_NO,
+      rowOrder: index,
+      rowKey: readingRowKey(SEED_BATCH_NO, {
+        code: point.code,
+        deviceType: device?.type ?? '接地体',
+        measuredOhm: point.measuredOhm,
+        limitOhm: point.limitOhm,
+        location: point.location
+      }),
+      code: point.code,
+      deviceType: device?.type ?? '接地体',
+      measuredOhm: point.measuredOhm,
+      limitOhm: point.limitOhm,
+      location: point.location,
+      meter: point.meter,
+      measureDate: point.measureDate,
+      status: 'attached',
+      action: actionOf(point),
+      pointId: point.id,
+      deviceId: point.deviceId,
+      reason: point.readingOrdinal > 1 ? '同测点多条读数，并列保留未覆盖首录值' : '按编号与装置类型挂回既有测点',
+      ...stamp(4000 + index)
+    }
+  })
+
+  // 待人工指派样本：编号在两条同类型引下线上都出现过，无法自动判定归属
+  const pendingRow = {
+    code: 'JD-OIL-03',
+    deviceType: '引下线' as const,
+    measuredOhm: 9.6,
+    limitOhm: 10,
+    location: '北侧引下线断接卡处（重测，归属待核）'
+  }
+  const pendingIndex = attached.length
+  const pending: Reading = {
+    id: 'rdg_seed_pending_01',
+    batchId: 'bat_seed01',
+    batchNo: SEED_BATCH_NO,
+    rowOrder: pendingIndex,
+    rowKey: readingRowKey(SEED_BATCH_NO, pendingRow),
+    ...pendingRow,
+    meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+    measureDate: new Date(now).toISOString().slice(0, 10),
+    status: 'pending',
+    action: 'none',
+    pointId: null,
+    deviceId: null,
+    reason: '同编号、同装置类型匹配到多条装置上的测点，请人工指派归属装置',
+    ...stamp(4000 + pendingIndex)
+  }
+
+  const batch: Batch = {
+    id: 'bat_seed01',
+    batchNo: SEED_BATCH_NO,
+    // 有待处理项时批次标记为已处理完但未闭环；页面会提示剩余待人工指派
+    status: 'completed',
+    sourceName: '临港油库外场检测手记-20260928.csv',
+    meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+    measureDate: new Date(now).toISOString().slice(0, 10),
+    totalRows: attached.length + 1,
+    duplicatedRows: 0,
+    checkpointIndex: attached.length + 1,
+    lastError: '',
+    buildingId: 'bld_oil01',
+    note: '外场带回的首批接地电阻数据：重复导入同批次不会重复建档，同测点多条读数并列保留。',
+    createdAt: now,
+    updatedAt: now,
+    completedAt: now,
+    failedAt: null
+  }
+  await db.batches.put(batch)
+  await db.readings.bulkPut([...attached, pending])
 }
 
 /** 打开数据库并幂等播种：仅当建筑物表为空时灌入演示数据 */
@@ -446,15 +667,21 @@ export async function initDatabase(): Promise<void> {
 
 /** 清空全部业务表（导入覆盖与重置共用） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.buildings, db.devices, db.points, db.verdicts, db.rectifies], async () => {
-    await Promise.all([
-      db.buildings.clear(),
-      db.devices.clear(),
-      db.points.clear(),
-      db.verdicts.clear(),
-      db.rectifies.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies, db.batches, db.readings],
+    async () => {
+      await Promise.all([
+        db.buildings.clear(),
+        db.devices.clear(),
+        db.points.clear(),
+        db.verdicts.clear(),
+        db.rectifies.clear(),
+        db.batches.clear(),
+        db.readings.clear()
+      ])
+    }
+  )
 }
 
 /** 清空并重新播种演示数据 */
@@ -465,14 +692,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与备份页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [buildings, devices, points, verdicts, rectifies] = await Promise.all([
+  const [buildings, devices, points, verdicts, rectifies, batches, readings] = await Promise.all([
     db.buildings.count(),
     db.devices.count(),
     db.points.count(),
     db.verdicts.count(),
-    db.rectifies.count()
+    db.rectifies.count(),
+    db.batches.count(),
+    db.readings.count()
   ])
-  return { buildings, devices, points, verdicts, rectifies }
+  return { buildings, devices, points, verdicts, rectifies, batches, readings }
 }
 
 /** 写入结构版本号到 localStorage，便于备份页比对 */

@@ -31,7 +31,15 @@
   import type { ConclusionLine, CountMap } from '$lib/utils/export.ts'
   import { RECTIFY_STATES } from '$lib/types/rectify.ts'
 
-  const EMPTY_COUNTS: CountMap = { buildings: 0, devices: 0, points: 0, verdicts: 0, rectifies: 0 }
+  const EMPTY_COUNTS: CountMap = {
+    buildings: 0,
+    devices: 0,
+    points: 0,
+    verdicts: 0,
+    rectifies: 0,
+    batches: 0,
+    readings: 0
+  }
 
   let counts = $state<CountMap>(EMPTY_COUNTS)
   let lastBackupAt = $state<string | null>(null)
@@ -262,7 +270,7 @@
   <div class="gb-panel">
     <div class="gb-panel-title">
       <h3>全量 JSON 导入导出</h3>
-      <span class="gb-hint">导出内容包含 buildings / devices / points / verdicts / rectifies 五张表</span>
+      <span class="gb-hint">导出内容包含 buildings / devices / points / verdicts / rectifies / batches / readings 七张表（含批次对账档案与读数留痕）</span>
     </div>
     <div class="import-row">
       <label class="gb-field">

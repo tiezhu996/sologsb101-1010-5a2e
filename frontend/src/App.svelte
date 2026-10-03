@@ -14,6 +14,7 @@
   import { useRouter } from '$lib/utils/router.ts'
   import { buildingList, buildingReady, deviceList } from '$lib/stores/buildingStore.ts'
   import { pointList } from '$lib/stores/pointStore.ts'
+  import { pendingReadings } from '$lib/stores/batchStore.ts'
   import { rectifyList } from '$lib/stores/rectifyStore.ts'
   import { DB_NAME, DB_VERSION } from '$lib/utils/db.ts'
   import { qualifyRate, isQualified } from '$lib/utils/resistance.ts'
@@ -65,6 +66,8 @@
             <em class="app-nav__badge">{$deviceList.length}</em>
           {:else if item.path === '/points'}
             <em class="app-nav__badge">{pointCount}</em>
+          {:else if item.path === '/batches'}
+            <em class="app-nav__badge">{$pendingReadings.length}</em>
           {:else if item.path === '/verdicts'}
             <em class="app-nav__badge">{unqualifiedCount}</em>
           {/if}
@@ -88,7 +91,7 @@
       本地库 {DB_NAME} · 结构版本 v{DB_VERSION} · 数据仅存于本浏览器 IndexedDB，不上传任何服务器。
     </span>
     <span>
-      建筑物 {$buildingList.length} · 装置 {$deviceList.length} · 测点 {pointCount} · 不合格 {unqualifiedCount} · 合格率 {rate}% · 未闭环整改 {pendingRectify}
+      建筑物 {$buildingList.length} · 装置 {$deviceList.length} · 测点 {pointCount} · 不合格 {unqualifiedCount} · 合格率 {rate}% · 未闭环整改 {pendingRectify} · 批次待处理 {$pendingReadings.length}
     </span>
   </footer>
 </div>

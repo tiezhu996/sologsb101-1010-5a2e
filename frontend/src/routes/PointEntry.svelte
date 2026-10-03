@@ -11,9 +11,8 @@
   import {
     activeDeviceId,
     bulkSetMeasured,
+    confirmedPointIds,
     createPoint,
-    importPointRows,
-    pasteText,
     pointList,
     pointRows,
     pointsOfDevice,
@@ -22,8 +21,8 @@
     updatePoint
   } from '$lib/stores/pointStore.ts'
   import { buildingById, deviceList, selectBuilding } from '$lib/stores/buildingStore.ts'
-  import { parsePointPaste } from '$lib/types/point.ts'
-  import type { Point, PointPasteRow } from '$lib/types/point.ts'
+  import { pendingReadings } from '$lib/stores/batchStore.ts'
+  import type { Point } from '$lib/types/point.ts'
   import { DEVICE_TYPES } from '$lib/types/device.ts'
   import type { DeviceType } from '$lib/types/device.ts'
   import { isQualified, limitRatio, qualifyRate, suggestLimitOhm } from '$lib/utils/resistance.ts'
@@ -39,6 +38,7 @@
     limitOhm: number
     meter: string
     measureDate: string
+    batchNo: string
   }
 
   const query = readQuery()
@@ -53,9 +53,6 @@
   let showDialog = $state(false)
   let editingId = $state<string | null>(null)
   let formError = $state('')
-  let showPaste = $state(false)
-  let pasteErrors = $state<string[]>([])
-  let pastePreview = $state<PointPasteRow[]>([])
   let bulkValue = $state<number | null>(null)
 
   let form = $state<PointForm>({
@@ -64,7 +61,8 @@
     measuredOhm: 0,
     limitOhm: 10,
     meter: '',
-    measureDate: new Date().toISOString().slice(0, 10)
+    measureDate: new Date().toISOString().slice(0, 10),
+    batchNo: ''
   })
 
   const deviceOptions = $derived(
@@ -124,7 +122,8 @@
       measuredOhm: 0,
       limitOhm: defaultLimit,
       meter: existing[0]?.meter ?? '',
-      measureDate: existing[0]?.measureDate ?? new Date().toISOString().slice(0, 10)
+      measureDate: existing[0]?.measureDate ?? new Date().toISOString().slice(0, 10),
+      batchNo: existing[0]?.batchNo ?? ''
     }
     showDialog = true
   }
@@ -138,10 +137,14 @@
       measuredOhm: point.measuredOhm,
       limitOhm: point.limitOhm,
       meter: point.meter,
-      measureDate: point.measureDate
+      measureDate: point.measureDate,
+      batchNo: point.batchNo
     }
     showDialog = true
   }
+
+  /** 正在编辑的测点判定是否已确认（实测值/限值锁定） */
+  const editingLocked = $derived(editingId !== null && $confirmedPointIds.has(editingId))
 
   async function submitForm(): Promise<void> {
     if (!form.code.trim()) {
@@ -162,14 +165,19 @@
       measuredOhm: Number(form.measuredOhm),
       limitOhm: Number(form.limitOhm),
       meter: form.meter.trim(),
-      measureDate: form.measureDate
+      measureDate: form.measureDate,
+      batchNo: form.batchNo.trim()
     }
-    if (editingId) {
-      await updatePoint(editingId, payload)
-    } else if ($activeDeviceId) {
-      await createPoint($activeDeviceId, payload)
+    try {
+      if (editingId) {
+        await updatePoint(editingId, payload)
+      } else if ($activeDeviceId) {
+        await createPoint($activeDeviceId, payload)
+      }
+      showDialog = false
+    } catch (error) {
+      formError = error instanceof Error ? error.message : '保存失败'
     }
-    showDialog = false
   }
 
   async function confirmRemove(point: Point): Promise<void> {
@@ -180,42 +188,14 @@
 
   async function applyBulkMeasured(): Promise<void> {
     if (!$activeDeviceId || bulkValue === null) return
-    const ok = window.confirm(
-      `将该装置全部 ${pointsOfDevice($activeDeviceId).length} 个测点的实测电阻统一改写为 ${bulkValue} Ω？`
-    )
-    if (!ok) return
-    await bulkSetMeasured($activeDeviceId, Number(bulkValue))
+    const result = await bulkSetMeasured($activeDeviceId, Number(bulkValue))
+    if (result.updated === 0 && result.skipped === 0) return
+    if (result.skipped > 0) {
+      window.alert(
+        `已改写 ${result.updated} 个测点；${result.skipped} 个测点（${result.skippedCodes.join('、')}）判定已确认，实测值锁定未改写。新读数请到「批次对账」页并列导入。`
+      )
+    }
     bulkValue = null
-  }
-
-  function openPaste(): void {
-    pasteText.set('')
-    pasteErrors = []
-    pastePreview = []
-    showPaste = true
-  }
-
-  function previewPaste(): void {
-    const parsed = parsePointPaste($pasteText, defaultLimit)
-    pasteErrors = parsed.errors
-    pastePreview = parsed.rows
-  }
-
-  async function submitPaste(): Promise<void> {
-    if (!$activeDeviceId) return
-    const parsed = parsePointPaste($pasteText, defaultLimit)
-    pasteErrors = parsed.errors
-    pastePreview = parsed.rows
-    if (parsed.rows.length === 0) return
-    const ok = window.confirm(
-      `将用 ${parsed.rows.length} 行数据替换该装置现有 ${pointsOfDevice($activeDeviceId).length} 个测点，确认导入？`
-    )
-    if (!ok) return
-    await importPointRows($activeDeviceId, parsed.rows, {
-      meter: pointsOfDevice($activeDeviceId)[0]?.meter ?? '未填写',
-      measureDate: new Date().toISOString().slice(0, 10)
-    })
-    showPaste = false
   }
 
   function handleFilterChange(next: FilterChange): void {
@@ -259,7 +239,7 @@
       {/if}
     </div>
     <div class="page__actions">
-      <button class="btn" type="button" onclick={openPaste}>批量粘贴</button>
+      <button class="btn" type="button" onclick={() => push('/batches')}>批次对账导入</button>
       <button class="btn btn--primary" type="button" onclick={openCreate}>＋ 新增测点</button>
     </div>
   </div>
@@ -292,17 +272,26 @@
     <div class="gb-panel">
       <div class="gb-panel-title">
         <h3>批量录入</h3>
-        <span class="gb-hint">适合野外手记一次性录入：统一改写实测值，或整段粘贴导入。</span>
+        <span class="gb-hint">
+          外场手记请走「批次对账导入」：同测点多条读数并列保留、已确认判定不覆盖。统一改写只影响未确认测点。
+        </span>
       </div>
       <div class="bulk-row">
         <label class="gb-field">
-          <span>统一实测电阻（Ω）</span>
+          <span>统一实测电阻（Ω，仅未确认测点）</span>
           <input type="number" min="0" step="0.01" bind:value={bulkValue} placeholder="如 4.5" />
         </label>
         <button class="btn" type="button" onclick={applyBulkMeasured}>批量改写实测值</button>
-        <button class="btn" type="button" onclick={openPaste}>批量粘贴导入</button>
+        <button class="btn" type="button" onclick={() => push('/batches')}>前往批次对账导入 →</button>
       </div>
     </div>
+  {/if}
+
+  {#if $pendingReadings.length > 0}
+    <p class="gb-alert">
+      有 {$pendingReadings.length} 条批次读数等待人工指派装置，
+      <button class="link" type="button" onclick={() => push('/batches')}>前往处理 →</button>
+    </p>
   {/if}
 
   {#if rows.length === 0}
@@ -326,6 +315,7 @@
             <th class="is-num">限值（Ω）</th>
             <th class="is-num">占限值</th>
             <th>判定</th>
+            <th>批次 / 序号</th>
             <th>检测仪器</th>
             <th>检测日期</th>
             <th>操作</th>
@@ -334,7 +324,11 @@
         <tbody>
           {#each rows as row (row.point.id)}
             <tr class:is-bad={!row.qualified}>
-              <td class="gb-mono">{row.point.code}</td>
+              <td class="gb-mono">
+                {row.point.code}
+                {#if row.point.readingOrdinal > 1}<em class="ordinal">#{row.point.readingOrdinal}</em>{/if}
+                {#if $confirmedPointIds.has(row.point.id)}<em class="lock" title="判定已确认，实测值与限值锁定">🔒</em>{/if}
+              </td>
               <td>{row.point.location}</td>
               <td>
                 <span class="gb-tag">{row.deviceType}</span>
@@ -350,6 +344,10 @@
                     超限 {((limitRatio(row.point.measuredOhm, row.point.limitOhm) - 1) * 100).toFixed(1)}%
                   </span>
                 {/if}
+              </td>
+              <td class="gb-hint gb-mono">
+                {row.point.batchNo || '—'}
+                {#if row.point.readingOrdinal > 1}<em class="ordinal">#{row.point.readingOrdinal}</em>{/if}
               </td>
               <td class="gb-hint">{row.point.meter}</td>
               <td class="gb-mono">{row.point.measureDate}</td>
@@ -390,10 +388,20 @@
         {#if formError}
           <p class="gb-alert">{formError}</p>
         {/if}
+        {#if editingLocked}
+          <p class="gb-alert">
+            该测点的判定已经检测人确认，实测电阻与限值已锁定不可改写；新读数请通过「批次对账」并列导入，
+            原结论与判定依据保留可查。
+          </p>
+        {/if}
         <div class="gb-modal__grid">
           <label class="gb-field">
             <span>测点编号 *</span>
             <input bind:value={form.code} placeholder="如 JD-01" maxlength="24" />
+          </label>
+          <label class="gb-field">
+            <span>来源批次号</span>
+            <input bind:value={form.batchNo} placeholder="如 PC-20261003-01（手工补录可留空）" maxlength="40" />
           </label>
           <label class="gb-field">
             <span>位置</span>
@@ -401,11 +409,11 @@
           </label>
           <label class="gb-field">
             <span>实测电阻（Ω）*</span>
-            <input type="number" min="0" max="1000" step="0.01" bind:value={form.measuredOhm} />
+            <input type="number" min="0" max="1000" step="0.01" bind:value={form.measuredOhm} disabled={editingLocked} />
           </label>
           <label class="gb-field">
             <span>限值（Ω）*</span>
-            <input type="number" min="0.01" max="1000" step="0.01" bind:value={form.limitOhm} />
+            <input type="number" min="0.01" max="1000" step="0.01" bind:value={form.limitOhm} disabled={editingLocked} />
           </label>
           <label class="gb-field">
             <span>检测仪器</span>
@@ -422,69 +430,6 @@
         <button class="btn btn--primary" type="button" onclick={submitForm}>
           {editingId ? '保存修改' : '新增测点'}
         </button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if showPaste}
-  <div class="gb-modal-backdrop" role="presentation" onclick={() => (showPaste = false)}>
-    <div
-      class="gb-modal"
-      role="dialog"
-      aria-modal="true"
-      tabindex="-1"
-      onclick={(event: MouseEvent) => event.stopPropagation()}
-      onkeydown={(event: KeyboardEvent) => event.stopPropagation()}
-    >
-      <div class="gb-modal__head">
-        <h3>批量粘贴导入测点</h3>
-        <button class="gb-modal__close" type="button" onclick={() => (showPaste = false)}>×</button>
-      </div>
-      <div class="gb-modal__body">
-        <p class="gb-hint">
-          每行一条，格式「测点编号,位置,实测电阻[,限值]」，逗号 / 制表符 / 分号均可。示例：<br />
-          <span class="gb-mono">JD-07,罐区东侧测试井,3.8,4</span><br />
-          <span class="gb-mono">JD-08;罐区西侧测试井;5.6;4</span>
-        </p>
-        <label class="gb-field">
-          <span>粘贴内容</span>
-          <textarea
-            rows="8"
-            value={$pasteText}
-            placeholder="JD-07,罐区东侧测试井,3.8,4"
-            oninput={(event: Event) => pasteText.set((event.currentTarget as HTMLTextAreaElement).value)}
-          ></textarea>
-        </label>
-        {#if pasteErrors.length > 0}
-          <div class="errors">
-            {#each pasteErrors as error, index (index)}
-              <p class="gb-alert">{error}</p>
-            {/each}
-          </div>
-        {/if}
-        {#if pastePreview.length > 0}
-          <table class="gb-table">
-            <thead>
-              <tr><th>编号</th><th>位置</th><th class="is-num">实测</th><th class="is-num">限值</th></tr>
-            </thead>
-            <tbody>
-              {#each pastePreview as row, index (index)}
-                <tr>
-                  <td class="gb-mono">{row.code}</td>
-                  <td>{row.location}</td>
-                  <td class="is-num gb-mono">{row.measuredOhm}</td>
-                  <td class="is-num gb-mono">{row.limitOhm}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        {/if}
-      </div>
-      <div class="gb-modal__foot">
-        <button class="btn" type="button" onclick={() => (showPaste = false)}>取消</button>
-        <button class="btn" type="button" onclick={previewPaste}>解析预览</button>
-        <button class="btn btn--primary" type="button" onclick={submitPaste}>覆盖导入</button>
       </div>
     </div>
   </div>
@@ -534,14 +479,6 @@
     background: #fff6f4;
   }
 
-  .errors {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    max-height: 160px;
-    overflow: auto;
-  }
-
   .link {
     border: none;
     background: transparent;
@@ -549,5 +486,18 @@
     text-decoration: underline;
     cursor: pointer;
     font-size: 12px;
+  }
+
+  .ordinal {
+    font-style: normal;
+    font-size: 11px;
+    color: #457b9d;
+    margin-left: 2px;
+  }
+
+  .lock {
+    font-style: normal;
+    font-size: 12px;
+    margin-left: 4px;
   }
 </style>

@@ -131,15 +131,17 @@ export async function updateBuilding(id: string, patch: Partial<Building>): Prom
   await db.buildings.update(id, { ...patch, updatedAt: Date.now() } as never)
 }
 
-/** 删除建筑物：级联删除其装置、测点、判定与整改建议 */
+/** 删除建筑物：级联删除其装置、测点、判定与整改建议；批次读数回到待处理，不丢留痕 */
 export async function removeBuilding(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies],
+    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies, db.readings, db.batches],
     async () => {
       const deviceIds = (await db.devices.where('buildingId').equals(id).toArray()).map((row) => row.id)
+      const pointIds: string[] = []
       if (deviceIds.length > 0) {
-        const pointIds = (await db.points.where('deviceId').anyOf(deviceIds).toArray()).map((row) => row.id)
+        const points = await db.points.where('deviceId').anyOf(deviceIds).toArray()
+        pointIds.push(...points.map((row) => row.id))
         if (pointIds.length > 0) {
           await db.verdicts.where('pointId').anyOf(pointIds).delete()
           await db.points.bulkDelete(pointIds)
@@ -147,6 +149,24 @@ export async function removeBuilding(id: string): Promise<void> {
         await db.devices.bulkDelete(deviceIds)
       }
       await db.rectifies.where('buildingId').equals(id).delete()
+      // 批次对账留痕不删：归属装置消失的读数回到待人工处理，可重新指派到其他装置
+      if (deviceIds.length > 0) {
+        const attachedReadings = await db.readings.where('deviceId').anyOf(deviceIds).toArray()
+        const touchedBatchIds = new Set(attachedReadings.map((reading) => reading.batchId))
+        await db.readings
+          .where('deviceId')
+          .anyOf(deviceIds)
+          .modify((reading) => {
+            reading.status = 'pending'
+            reading.pointId = null
+            reading.deviceId = null
+            reading.reason = '原归属建筑物/装置已删除，请重新指派装置'
+            reading.updatedAt = Date.now()
+          })
+        for (const batchId of touchedBatchIds) {
+          await db.batches.update(batchId, { lastError: '有读数因装置删除回到待处理', updatedAt: Date.now() })
+        }
+      }
       await db.buildings.delete(id)
     }
   )
@@ -171,13 +191,25 @@ export async function updateDevice(id: string, patch: Partial<Device>): Promise<
   await db.devices.update(id, { ...patch, updatedAt: Date.now() } as never)
 }
 
-/** 删除装置：级联删除其测点与判定 */
+/** 删除装置：级联删除其测点与判定；批次读数回到待人工处理，不丢留痕 */
 export async function removeDevice(id: string): Promise<void> {
-  await db.transaction('rw', [db.devices, db.points, db.verdicts], async () => {
+  await db.transaction('rw', [db.devices, db.points, db.verdicts, db.readings, db.batches], async () => {
     const pointIds = (await db.points.where('deviceId').equals(id).toArray()).map((row) => row.id)
     if (pointIds.length > 0) {
       await db.verdicts.where('pointId').anyOf(pointIds).delete()
       await db.points.bulkDelete(pointIds)
+    }
+    const attachedReadings = await db.readings.where('deviceId').equals(id).toArray()
+    const touchedBatchIds = new Set(attachedReadings.map((reading) => reading.batchId))
+    await db.readings.where('deviceId').equals(id).modify((reading) => {
+      reading.status = 'pending'
+      reading.pointId = null
+      reading.deviceId = null
+      reading.reason = '原归属装置已删除，请重新指派装置'
+      reading.updatedAt = Date.now()
+    })
+    for (const batchId of touchedBatchIds) {
+      await db.batches.update(batchId, { lastError: '有读数因装置删除回到待处理', updatedAt: Date.now() })
     }
     await db.devices.delete(id)
   })

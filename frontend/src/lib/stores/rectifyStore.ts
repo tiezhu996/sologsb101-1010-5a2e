@@ -150,20 +150,28 @@ export function resetRectifyFilter(): void {
 
 /* ------------------------------- 判定 ------------------------------- */
 
-/** 自动初判某测点，并写入判定记录（检测人确认前 confirmed = false） */
+/**
+ * 自动初判某测点，并写入判定记录（检测人确认前 confirmed = false）。
+ * 已确认的判定不被后来的实测值覆盖：若记录已确认，原样返回不重算。
+ */
 export async function autoJudgePoint(pointId: string, inspector = ''): Promise<Verdict | null> {
   const point = get(pointList).find((item) => item.id === pointId)
   if (!point) return null
   const device = get(deviceList).find((item) => item.id === point.deviceId)
   const building = device ? get(buildingList).find((item) => item.id === device.buildingId) : undefined
-  const result = judgePoint(point.measuredOhm, point.limitOhm)
   const existing = get(verdictList).find((item) => item.pointId === pointId)
+  if (existing?.confirmed) {
+    // 已确认结论锁定：即使后来导入了新的实测值，也不覆盖当时的结论与限值
+    return existing
+  }
+  const result = judgePoint(point.measuredOhm, point.limitOhm)
   const now = Date.now()
   const row: Verdict = {
     id: existing?.id ?? `vrd_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
     pointId,
     result,
     basis: existing?.basis || defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
+    limitOhm: point.limitOhm,
     inspector: inspector || existing?.inspector || '',
     verdictDate: point.measureDate,
     confirmed: false,
@@ -174,7 +182,7 @@ export async function autoJudgePoint(pointId: string, inspector = ''): Promise<V
   return row
 }
 
-/** 批量自动初判（判定台一键操作） */
+/** 批量自动初判（判定台一键操作）；已确认的测点保持原结论不动 */
 export async function autoJudgeAll(inspector = '陈立群'): Promise<number> {
   const points = get(pointList)
   for (const point of points) {
@@ -183,12 +191,21 @@ export async function autoJudgeAll(inspector = '陈立群'): Promise<number> {
   return points.length
 }
 
-/** 检测人确认判定结论生效 */
+/**
+ * 检测人确认判定结论生效；同时把确认当时所依据的限值写入快照，
+ * 之后该测点再导入新实测值也不影响本结论。
+ */
 export async function confirmVerdict(id: string, patch: Partial<Verdict> = {}): Promise<void> {
-  await db.verdicts.update(id, { ...patch, confirmed: true, updatedAt: Date.now() } as never)
+  const existing = await db.verdicts.get(id)
+  let limitOhm = existing?.limitOhm
+  if (typeof limitOhm !== 'number' || limitOhm <= 0) {
+    const point = existing ? await db.points.get(existing.pointId) : undefined
+    limitOhm = point?.limitOhm ?? 10
+  }
+  await db.verdicts.update(id, { ...patch, confirmed: true, limitOhm, updatedAt: Date.now() } as never)
 }
 
-/** 批量改判定结论（判定台批量操作） */
+/** 批量改判定结论（判定台批量操作，属检测人显式改判，确认生效并记录当时限值） */
 export async function bulkSetVerdictResult(pointIds: string[], result: VerdictResult, inspector: string): Promise<number> {
   const now = Date.now()
   for (const pointId of pointIds) {
@@ -202,6 +219,7 @@ export async function bulkSetVerdictResult(pointIds: string[], result: VerdictRe
       pointId,
       result,
       basis: existing?.basis || defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
+      limitOhm: point.limitOhm,
       inspector,
       verdictDate: existing?.verdictDate ?? point.measureDate,
       confirmed: true,

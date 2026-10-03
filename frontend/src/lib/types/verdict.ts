@@ -12,6 +12,8 @@ export interface Verdict {
   result: VerdictResult
   /** 判定依据（规范条款 / 限值来源） */
   basis: string
+  /** 确认当时所依据的限值快照（Ω）：后续实测值改写不再影响已确认结论 */
+  limitOhm: number
   /** 检测人 */
   inspector: string
   /** 判定日期 */

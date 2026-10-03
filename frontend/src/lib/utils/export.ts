@@ -11,21 +11,26 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '$lib/utils/db'
+import type { Point } from '$lib/types/point'
+import type { Verdict } from '$lib/types/verdict'
+import { LEGACY_BATCH_ID, LEGACY_BATCH_NO } from '$lib/types/batch'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['buildings', 'devices', 'points', 'verdicts', 'rectifies'] as const
+export const BACKUP_KEYS = ['buildings', 'devices', 'points', 'verdicts', 'rectifies', 'batches', 'readings'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [buildings, devices, points, verdicts, rectifies] = await Promise.all([
+  const [buildings, devices, points, verdicts, rectifies, batches, readings] = await Promise.all([
     db.buildings.toArray(),
     db.devices.toArray(),
     db.points.toArray(),
     db.verdicts.toArray(),
-    db.rectifies.toArray()
+    db.rectifies.toArray(),
+    db.batches.toArray(),
+    db.readings.toArray()
   ])
   return {
     app: 'gblightprot',
@@ -35,7 +40,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     devices,
     points,
     verdicts,
-    rectifies
+    rectifies,
+    batches,
+    readings
   }
 }
 
@@ -49,7 +56,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== undefined && obj.app !== 'gblightprot') {
     errors.push('app 字段应为 gblightprot，文件来源不明')
   }
-  for (const key of BACKUP_KEYS) {
+  // batches / readings 为 v3 新增：旧备份没有时允许，按兼容规则回填
+  for (const key of ['buildings', 'devices', 'points', 'verdicts', 'rectifies'] as const) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -59,11 +67,94 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
     buildings: obj.buildings ?? [],
     devices: obj.devices ?? [],
-    points: obj.points ?? [],
-    verdicts: obj.verdicts ?? [],
-    rectifies: obj.rectifies ?? []
+    points: normalizePoints(obj.points ?? []),
+    verdicts: normalizeVerdicts(obj.verdicts ?? [], obj.points ?? []),
+    rectifies: obj.rectifies ?? [],
+    batches: Array.isArray(obj.batches) ? obj.batches : [],
+    readings: Array.isArray(obj.readings) ? obj.readings : []
   }
   return { ok: true, errors, payload }
+}
+
+/** 旧备份测点补齐批次来源与并列序号 */
+function normalizePoints(points: Point[]): Point[] {
+  return points.map((point) => ({
+    ...point,
+    batchNo: point.batchNo || LEGACY_BATCH_NO,
+    readingOrdinal: typeof point.readingOrdinal === 'number' ? point.readingOrdinal : 1
+  }))
+}
+
+/** 旧备份判定补齐确认时限值快照 */
+function normalizeVerdicts(verdicts: Verdict[], points: Point[]): Verdict[] {
+  const limitOfPoint = new Map(points.map((point) => [point.id, point.limitOhm]))
+  return verdicts.map((verdict) => ({
+    ...verdict,
+    limitOhm: typeof verdict.limitOhm === 'number' ? verdict.limitOhm : limitOfPoint.get(verdict.pointId) ?? 10
+  }))
+}
+
+/**
+ * 兼容规则：导入数据没有批次来源时，把测点/判定归入初始批次，
+ * 原有测点、判定与整改均原样保留可查。
+ */
+export function ensureLegacyBatch(payload: BackupPayload): BackupPayload {
+  const legacyPoints = payload.points.filter((point) => !point.batchNo || point.batchNo === LEGACY_BATCH_NO)
+  if (legacyPoints.length === 0 || payload.batches.some((batch) => batch.id === LEGACY_BATCH_ID)) {
+    return { ...payload, points: normalizePoints(payload.points), verdicts: normalizeVerdicts(payload.verdicts, payload.points) }
+  }
+  const now = Date.now()
+  const deviceTypeOf = new Map(
+    payload.devices.map((device) => [device.id, device.type])
+  )
+  const readings = legacyPoints.map((point, index) => ({
+    id: `rdg_legacy_import_${index}_${point.id}`.slice(0, 80),
+    batchId: LEGACY_BATCH_ID,
+    batchNo: LEGACY_BATCH_NO,
+    rowOrder: index,
+    rowKey: [LEGACY_BATCH_NO, point.code, deviceTypeOf.get(point.deviceId) ?? '接地体', point.measuredOhm, point.limitOhm, point.location].join('|'),
+    code: point.code,
+    deviceType: deviceTypeOf.get(point.deviceId) ?? '接地体',
+    measuredOhm: point.measuredOhm,
+    limitOhm: point.limitOhm,
+    location: point.location,
+    meter: point.meter ?? '',
+    measureDate: point.measureDate ?? '',
+    status: 'attached' as const,
+    action: 'migrated-legacy' as const,
+    pointId: point.id,
+    deviceId: point.deviceId,
+    reason: '旧数据（无批次来源）导入时回填初始批次',
+    createdAt: point.createdAt ?? now,
+    updatedAt: point.updatedAt ?? now
+  }))
+  return {
+    ...payload,
+    points: normalizePoints(payload.points),
+    verdicts: normalizeVerdicts(payload.verdicts, payload.points),
+    batches: [
+      ...payload.batches,
+      {
+        id: LEGACY_BATCH_ID,
+        batchNo: LEGACY_BATCH_NO,
+        status: 'completed' as const,
+        sourceName: '旧备份兼容回填',
+        meter: '',
+        measureDate: '',
+        totalRows: legacyPoints.length,
+        duplicatedRows: 0,
+        checkpointIndex: legacyPoints.length,
+        lastError: '',
+        buildingId: null,
+        note: '导入无批次来源的旧备份时自动生成，测点、判定与整改原样保留。',
+        createdAt: now,
+        updatedAt: now,
+        completedAt: now,
+        failedAt: null
+      }
+    ],
+    readings: [...payload.readings, ...readings]
+  }
 }
 
 /** 统计快照各表行数 */
@@ -73,7 +164,9 @@ export function countPayload(payload: BackupPayload): CountMap {
     devices: payload.devices.length,
     points: payload.points.length,
     verdicts: payload.verdicts.length,
-    rectifies: payload.rectifies.length
+    rectifies: payload.rectifies.length,
+    batches: payload.batches.length,
+    readings: payload.readings.length
   }
 }
 
@@ -108,22 +201,34 @@ export function readFileText(file: File): Promise<string> {
 
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
+  const normalized = ensureLegacyBatch(payload)
   if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.buildings, db.devices, db.points, db.verdicts, db.rectifies], async () => {
-    await db.buildings.bulkPut(payload.buildings)
-    await db.devices.bulkPut(payload.devices)
-    await db.points.bulkPut(payload.points)
-    await db.verdicts.bulkPut(payload.verdicts)
-    await db.rectifies.bulkPut(payload.rectifies)
-  })
-  return countPayload(payload)
+  await db.transaction(
+    'rw',
+    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies, db.batches, db.readings],
+    async () => {
+      await db.buildings.bulkPut(normalized.buildings)
+      await db.devices.bulkPut(normalized.devices)
+      await db.points.bulkPut(normalized.points)
+      await db.verdicts.bulkPut(normalized.verdicts)
+      await db.rectifies.bulkPut(normalized.rectifies)
+      await db.batches.bulkPut(normalized.batches)
+      await db.readings.bulkPut(normalized.readings)
+    }
+  )
+  return countPayload(normalized)
 }
 
-/** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
+/**
+ * 追加式导入：为导入数据重新分配 id，避免覆盖现有档案。
+ * 批次号若与本地已有批次冲突，追加「-导入」后缀以保证批次档案可区分、可对账。
+ */
 export function remapIds(payload: BackupPayload): BackupPayload {
   const buildingMap = new Map<string, string>()
   const deviceMap = new Map<string, string>()
   const pointMap = new Map<string, string>()
+  const batchMap = new Map<string, string>()
+  const batchNoMap = new Map<string, string>()
 
   const buildings = payload.buildings.map((building) => {
     const id = createId('bld')
@@ -151,7 +256,22 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     buildingId: buildingMap.get(rectify.buildingId) ?? rectify.buildingId,
     pointId: rectify.pointId ? pointMap.get(rectify.pointId) ?? rectify.pointId : null
   }))
-  return { ...payload, buildings, devices, points, verdicts, rectifies }
+  const batches = payload.batches.map((batch) => {
+    const id = createId('bat')
+    batchMap.set(batch.id, id)
+    const nextBatchNo = batch.batchNo ? `${batch.batchNo}-导入` : batch.batchNo
+    batchNoMap.set(batch.id, nextBatchNo)
+    return { ...batch, id, batchNo: nextBatchNo, status: 'completed' as const }
+  })
+  const readings = payload.readings.map((reading) => ({
+    ...reading,
+    id: createId('rdg'),
+    batchId: batchMap.get(reading.batchId) ?? reading.batchId,
+    batchNo: batchNoMap.get(reading.batchId) ?? reading.batchNo,
+    pointId: reading.pointId ? pointMap.get(reading.pointId) ?? reading.pointId : null,
+    deviceId: reading.deviceId ? deviceMap.get(reading.deviceId) ?? reading.deviceId : null
+  }))
+  return { ...payload, buildings, devices, points, verdicts, rectifies, batches, readings }
 }
 
 /** 检测结论行：按建筑物汇总测点数、不合格数与结论文字 */

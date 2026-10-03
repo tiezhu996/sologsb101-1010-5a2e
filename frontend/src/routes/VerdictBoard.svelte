@@ -391,6 +391,9 @@
                   <div class="gb-hint">
                     {row.verdict.confirmed ? '已确认生效' : '待检测人确认'} · {row.verdict.inspector || '未署名'}
                   </div>
+                  {#if row.verdict.confirmed}
+                    <div class="gb-hint">确认时限值 {row.verdict.limitOhm} Ω{#if row.verdict.limitOhm !== row.point.limitOhm}（当前测点限值 {row.point.limitOhm} Ω）{/if}</div>
+                  {/if}
                   {#if !row.consistent}
                     <div class="gb-danger">与初判不一致</div>
                   {/if}

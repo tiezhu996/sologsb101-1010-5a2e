@@ -9,8 +9,17 @@ import { derived, get, writable } from 'svelte/store'
 import { db, watchTable } from '$lib/utils/db'
 import type { Point, PointDraft } from '$lib/types/point'
 import { createEmptyPointDraft } from '$lib/types/point'
+import { LEGACY_BATCH_NO } from '$lib/types/batch'
 import { deviceList } from '$lib/stores/buildingStore'
 import { isQualified, limitRatio } from '$lib/utils/resistance'
+
+/** 已由检测人确认判定的测点：其实测值/限值不允许再被改写 */
+export class ProtectedPointError extends Error {
+  constructor(code: string) {
+    super(`测点「${code}」的判定已经检测人确认，实测值与限值已锁定；新读数请按批次并列导入，不会覆盖已确认结论。`)
+    this.name = 'ProtectedPointError'
+  }
+}
 
 /** 响应式测点集合 */
 export const pointList = writable<Point[]>([])
@@ -59,6 +68,30 @@ export const pointRows = derived([pointList, deviceList], ([$points, $devices]) 
     .sort((a, b) => b.ratio - a.ratio)
 )
 
+/** 查询测点的判定是否已确认（实测值/限值因此锁定） */
+export async function isPointConfirmed(pointId: string): Promise<boolean> {
+  const verdict = await db.verdicts.where('pointId').equals(pointId).first()
+  return Boolean(verdict?.confirmed)
+}
+
+/**
+ * 已确认判定的测点 id 集合（锁定标记）。
+ * 直接经 watchTable 订阅 verdicts，避免 import rectifyStore 形成
+ * rectifyStore → pointStore → rectifyStore 的 ES 模块循环依赖（TDZ 白屏）。
+ */
+import type { Verdict } from '$lib/types/verdict'
+const verdictsForPoints = writable<Verdict[]>([])
+watchTable<Verdict>(() => db.verdicts).subscribe((rows) => {
+  verdictsForPoints.set(rows)
+})
+export const confirmedPointIds = derived(verdictsForPoints, ($verdicts) => {
+  const ids = new Set<string>()
+  $verdicts.forEach((verdict) => {
+    if (verdict.confirmed) ids.add(verdict.pointId)
+  })
+  return ids
+})
+
 export function resetPointDraft(limitOhm = 10): void {
   pointDraft.set(createEmptyPointDraft(limitOhm))
 }
@@ -71,12 +104,16 @@ export function setActiveDevice(deviceId: string | null): void {
 
 export async function createPoint(
   deviceId: string,
-  payload: Omit<Point, 'id' | 'createdAt' | 'updatedAt' | 'deviceId'>
+  payload: Omit<Point, 'id' | 'createdAt' | 'updatedAt' | 'deviceId' | 'readingOrdinal'> & {
+    readingOrdinal?: number
+  }
 ): Promise<Point> {
   const now = Date.now()
   const row: Point = {
     ...payload,
     deviceId,
+    batchNo: payload.batchNo || LEGACY_BATCH_NO,
+    readingOrdinal: payload.readingOrdinal ?? 1,
     id: `pnt_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
     createdAt: now,
     updatedAt: now
@@ -85,55 +122,60 @@ export async function createPoint(
   return row
 }
 
+/**
+ * 编辑测点：若测点存在已确认判定，则实测电阻与限值锁定（拒绝覆盖），
+ * 位置 / 仪器等非判定字段仍可修改。
+ */
 export async function updatePoint(id: string, patch: Partial<Point>): Promise<void> {
+  if (patch.measuredOhm !== undefined || patch.limitOhm !== undefined) {
+    const confirmed = await isPointConfirmed(id)
+    if (confirmed) {
+      const point = await db.points.get(id)
+      throw new ProtectedPointError(point?.code ?? id)
+    }
+  }
   await db.points.update(id, { ...patch, updatedAt: Date.now() } as never)
 }
 
-/** 删除测点：同时删除其判定记录 */
+/** 删除测点：同时删除其判定记录；批次读数回到待人工处理（留痕不丢，可重新挂接） */
 export async function removePoint(id: string): Promise<void> {
-  await db.transaction('rw', [db.points, db.verdicts], async () => {
+  await db.transaction('rw', [db.points, db.verdicts, db.readings], async () => {
     await db.verdicts.where('pointId').equals(id).delete()
     await db.points.delete(id)
-  })
-}
-
-/** 批量改写某装置全部测点的实测电阻（批量录入场景） */
-export async function bulkSetMeasured(deviceId: string, measuredOhm: number): Promise<number> {
-  const now = Date.now()
-  await db.points
-    .where('deviceId')
-    .equals(deviceId)
-    .modify((point) => {
-      point.measuredOhm = measuredOhm
-      point.updatedAt = now
+    await db.readings.where('pointId').equals(id).modify((reading) => {
+      reading.status = 'pending'
+      reading.pointId = null
+      reading.deviceId = null
+      reading.reason = '原挂接测点已删除，请重新指派装置'
+      reading.updatedAt = Date.now()
     })
-  return pointsOfDevice(deviceId).length
+  })
 }
 
-/** 批量导入解析后的粘贴行（替换该装置原有测点） */
-export async function importPointRows(
+/**
+ * 批量改写某装置全部测点的实测电阻；已确认判定的测点自动跳过、不改写。
+ * @returns 改写条数与因判定已确认而跳过的条数
+ */
+export async function bulkSetMeasured(
   deviceId: string,
-  rows: Array<{ code: string; location: string; measuredOhm: number; limitOhm: number }>,
-  meta: { meter: string; measureDate: string }
-): Promise<number> {
+  measuredOhm: number
+): Promise<{ updated: number; skipped: number; skippedCodes: string[] }> {
   const now = Date.now()
-  const records: Point[] = rows.map((row, index) => ({
-    id: `pnt_${Date.now().toString(36)}${index}${Math.random().toString(36).slice(2, 6)}`,
-    deviceId,
-    code: row.code,
-    location: row.location,
-    measuredOhm: row.measuredOhm,
-    limitOhm: row.limitOhm,
-    meter: meta.meter,
-    measureDate: meta.measureDate,
-    createdAt: now + index,
-    updatedAt: now + index
-  }))
-  await db.transaction('rw', [db.points, db.verdicts], async () => {
-    const oldIds = (await db.points.where('deviceId').equals(deviceId).toArray()).map((row) => row.id)
-    if (oldIds.length > 0) await db.verdicts.where('pointId').anyOf(oldIds).delete()
-    await db.points.where('deviceId').equals(deviceId).delete()
-    await db.points.bulkPut(records)
-  })
-  return records.length
+  const [points, verdicts] = await Promise.all([
+    db.points.where('deviceId').equals(deviceId).toArray(),
+    db.verdicts.toArray()
+  ])
+  const confirmedIds = new Set(verdicts.filter((verdict) => verdict.confirmed).map((verdict) => verdict.pointId))
+  const skippedCodes = points.filter((point) => confirmedIds.has(point.id)).map((point) => point.code)
+  const targets = points.filter((point) => !confirmedIds.has(point.id))
+  if (targets.length > 0) {
+    await db.points
+      .where('id')
+      .anyOf(targets.map((point) => point.id))
+      .modify((point) => {
+        point.measuredOhm = measuredOhm
+        point.updatedAt = now
+      })
+  }
+  return { updated: targets.length, skipped: skippedCodes.length, skippedCodes }
 }
