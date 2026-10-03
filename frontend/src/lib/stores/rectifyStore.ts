@@ -167,6 +167,8 @@ export async function autoJudgePoint(pointId: string, inspector = ''): Promise<V
     inspector: inspector || existing?.inspector || '',
     verdictDate: point.measureDate,
     confirmed: false,
+    // 判定当时的限值快照：确认后不再随测点限值变化
+    limitOhm: point.limitOhm,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now
   }
@@ -205,6 +207,8 @@ export async function bulkSetVerdictResult(pointIds: string[], result: VerdictRe
       inspector,
       verdictDate: existing?.verdictDate ?? point.measureDate,
       confirmed: true,
+      // 改判以当前测点限值为准，重新留快照
+      limitOhm: point.limitOhm,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
     }

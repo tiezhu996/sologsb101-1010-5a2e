@@ -14,7 +14,7 @@
  */
 
 /** 应用内的真实路径（history 模式），用于导航与高亮 */
-export const ROUTE_PATHS = ['/buildings', '/devices', '/points', '/verdicts', '/backup'] as const
+export const ROUTE_PATHS = ['/buildings', '/devices', '/points', '/batches', '/verdicts', '/backup'] as const
 export type RoutePath = (typeof ROUTE_PATHS)[number]
 
 /** 未知路径兜底（catch-all）路径 */

@@ -71,13 +71,17 @@ export function setActiveDevice(deviceId: string | null): void {
 
 export async function createPoint(
   deviceId: string,
-  payload: Omit<Point, 'id' | 'createdAt' | 'updatedAt' | 'deviceId'>
+  payload: Omit<Point, 'id' | 'createdAt' | 'updatedAt' | 'deviceId' | 'batchId' | 'batchNo' | 'seq'>
 ): Promise<Point> {
   const now = Date.now()
   const row: Point = {
     ...payload,
     deviceId,
     id: `pnt_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+    // 手工录入的测点不属于任何导入批次
+    batchId: null,
+    batchNo: '',
+    seq: 1,
     createdAt: now,
     updatedAt: now
   }
@@ -126,6 +130,10 @@ export async function importPointRows(
     limitOhm: row.limitOhm,
     meter: meta.meter,
     measureDate: meta.measureDate,
+    // 装置级粘贴导入不走批次对账，来源批次留空
+    batchId: null,
+    batchNo: '',
+    seq: 1,
     createdAt: now + index,
     updatedAt: now + index
   }))

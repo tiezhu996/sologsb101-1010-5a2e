@@ -398,7 +398,12 @@
                   <span class="gb-hint">尚未判定</span>
                 {/if}
               </td>
-              <td class="gb-hint">{row.verdict?.basis ?? '—'}</td>
+              <td class="gb-hint">
+                {row.verdict?.basis ?? '—'}
+                {#if row.verdict}
+                  <div class="gb-hint">判定限值快照 {row.verdict.limitOhm} Ω（当时限值，确认后不随测点改动）</div>
+                {/if}
+              </td>
               <td class="row-actions">
                 <button class="btn btn--small" type="button" onclick={() => runAutoJudge(row.point.id)}>初判</button>
                 <button class="btn btn--primary btn--small" type="button" onclick={() => confirmOne(row)}>

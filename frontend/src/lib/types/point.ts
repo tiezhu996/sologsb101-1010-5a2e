@@ -15,6 +15,12 @@ export interface Point {
   meter: string
   /** 检测日期 */
   measureDate: string
+  /** 来源批次 id（手工录入为 null；v3 前旧数据回填为初始批次） */
+  batchId: string | null
+  /** 来源批次号（冗余批次表，便于对账展示；手工录入为空串） */
+  batchNo: string
+  /** 同批次同测点并列序号（从 1 开始，并列保留时递增） */
+  seq: number
   createdAt: number
   updatedAt: number
 }

@@ -14,10 +14,12 @@ import type { Verdict } from '$lib/types/verdict'
 import { defaultBasis, judgePoint } from '$lib/types/verdict'
 import type { Rectify } from '$lib/types/rectify'
 import { SUGGESTION_TEMPLATES } from '$lib/types/rectify'
+import type { ImportBatch, ImportRow } from '$lib/types/batch'
+import { LEGACY_BATCH_ID, LEGACY_BATCH_NO } from '$lib/types/batch'
 import { suggestLimitOhm } from '$lib/utils/resistance'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gblightprot'
@@ -39,6 +41,9 @@ export interface BackupPayload {
   points: Point[]
   verdicts: Verdict[]
   rectifies: Rectify[]
+  /** v3 起包含导入批次与批次行；旧备份文件可能缺失，导入时按空数组兼容 */
+  batches: ImportBatch[]
+  importRows: ImportRow[]
 }
 
 export class LightProtDatabase extends Dexie {
@@ -47,6 +52,8 @@ export class LightProtDatabase extends Dexie {
   points!: Table<Point, string>
   verdicts!: Table<Verdict, string>
   rectifies!: Table<Rectify, string>
+  batches!: Table<ImportBatch, string>
+  importRows!: Table<ImportRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -61,7 +68,7 @@ export class LightProtDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（用途/类别/层数、装置类型、限值、判定与状态）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         buildings: 'id, name, usage, protectionClass, floors, heightM, updatedAt',
         devices: 'id, buildingId, type, material, spec, quantity, installDate, updatedAt',
@@ -89,6 +96,57 @@ export class LightProtDatabase extends Dexie {
               Object.assign(row, factory())
             })
         }
+      })
+
+    // v3：新增导入批次对账（batches / importRows），测点记录来源批次，判定记录限值快照
+    this.version(DB_VERSION)
+      .stores({
+        buildings: 'id, name, usage, protectionClass, floors, heightM, updatedAt',
+        devices: 'id, buildingId, type, material, spec, quantity, installDate, updatedAt',
+        points: 'id, deviceId, code, measuredOhm, limitOhm, measureDate, updatedAt, batchId, batchNo, [batchId+code]',
+        verdicts: 'id, pointId, result, confirmed, verdictDate, updatedAt',
+        rectifies: 'id, buildingId, pointId, state, deadline, updatedAt',
+        batches: 'id, batchNo, state, deviceType, buildingId, updatedAt',
+        importRows: 'id, batchId, rowIndex, state, fingerprint, [batchId+rowIndex]'
+      })
+      .upgrade(async (tx) => {
+        // 兼容规则：没有批次来源的旧测点统一回填到「初始批次」，
+        // 判定记录回填判定当时的限值快照；原有测点、判定、整改内容保持不变。
+        const now = Date.now()
+        const pointRows = (await tx.table('points').toArray()) as Array<Record<string, unknown>>
+        await tx.table('batches').put({
+          id: LEGACY_BATCH_ID,
+          batchNo: LEGACY_BATCH_NO,
+          buildingId: '',
+          deviceType: '接地体',
+          sourceNote: '结构升级兼容回填：v3 之前的历史测点统一归入初始批次',
+          state: '已完成',
+          totalRows: pointRows.length,
+          doneRows: pointRows.length,
+          failedRows: 0,
+          cursor: pointRows.length + 1,
+          createdAt: now,
+          updatedAt: now
+        } satisfies ImportBatch)
+        await tx
+          .table('points')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.batchId !== 'string' || row.batchId.length === 0) {
+              row.batchId = LEGACY_BATCH_ID
+              row.batchNo = LEGACY_BATCH_NO
+            }
+            if (typeof row.seq !== 'number') row.seq = 1
+          })
+        const limitByPoint = new Map(pointRows.map((row) => [String(row.id), Number(row.limitOhm) || 10]))
+        await tx
+          .table('verdicts')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.limitOhm !== 'number') {
+              row.limitOhm = limitByPoint.get(String(row.pointId)) ?? 10
+            }
+          })
       })
   }
 }
@@ -351,7 +409,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies],
+    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies, db.batches],
     async () => {
       const stamp = (index: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + index,
@@ -366,11 +424,34 @@ export async function seedDemoData(): Promise<void> {
         const { points, ...rest } = device
         allDevices.push({ ...rest, ...stamp(index) })
         points.forEach((point, pointIndex) => {
-          allPoints.push({ ...point, ...stamp(index * 100 + pointIndex) })
+          // 演示数据视同初始批次导入：记录来源批次，并列序号从 1 开始
+          allPoints.push({
+            ...point,
+            batchId: LEGACY_BATCH_ID,
+            batchNo: LEGACY_BATCH_NO,
+            seq: 1,
+            ...stamp(index * 100 + pointIndex)
+          })
         })
       })
       await db.devices.bulkPut(allDevices)
       await db.points.bulkPut(allPoints)
+
+      // 初始批次档案：演示 / 历史数据的统一来源批次
+      const seedBatch: ImportBatch = {
+        id: LEGACY_BATCH_ID,
+        batchNo: LEGACY_BATCH_NO,
+        buildingId: '',
+        deviceType: '接地体',
+        sourceNote: '初始批次：演示播种与历史数据兼容回填的统一来源',
+        state: '已完成',
+        totalRows: allPoints.length,
+        doneRows: allPoints.length,
+        failedRows: 0,
+        cursor: allPoints.length + 1,
+        ...stamp(900)
+      }
+      await db.batches.put(seedBatch)
 
       // 逐点自动初判：实测值 ≤ 限值判合格，否则不合格，检测人确认后生效
       const buildingOfDevice = new Map(allDevices.map((device) => [device.id, device.buildingId]))
@@ -386,6 +467,8 @@ export async function seedDemoData(): Promise<void> {
           inspector: '陈立群',
           verdictDate: point.measureDate,
           confirmed: true,
+          // 判定当时的限值快照：确认后不再随测点限值变化
+          limitOhm: point.limitOhm,
           ...stamp(1000 + index)
         }
       })
@@ -446,15 +529,21 @@ export async function initDatabase(): Promise<void> {
 
 /** 清空全部业务表（导入覆盖与重置共用） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.buildings, db.devices, db.points, db.verdicts, db.rectifies], async () => {
-    await Promise.all([
-      db.buildings.clear(),
-      db.devices.clear(),
-      db.points.clear(),
-      db.verdicts.clear(),
-      db.rectifies.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies, db.batches, db.importRows],
+    async () => {
+      await Promise.all([
+        db.buildings.clear(),
+        db.devices.clear(),
+        db.points.clear(),
+        db.verdicts.clear(),
+        db.rectifies.clear(),
+        db.batches.clear(),
+        db.importRows.clear()
+      ])
+    }
+  )
 }
 
 /** 清空并重新播种演示数据 */
@@ -465,14 +554,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与备份页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [buildings, devices, points, verdicts, rectifies] = await Promise.all([
+  const [buildings, devices, points, verdicts, rectifies, batches, importRows] = await Promise.all([
     db.buildings.count(),
     db.devices.count(),
     db.points.count(),
     db.verdicts.count(),
-    db.rectifies.count()
+    db.rectifies.count(),
+    db.batches.count(),
+    db.importRows.count()
   ])
-  return { buildings, devices, points, verdicts, rectifies }
+  return { buildings, devices, points, verdicts, rectifies, batches, importRows }
 }
 
 /** 写入结构版本号到 localStorage，便于备份页比对 */

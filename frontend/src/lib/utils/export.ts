@@ -12,20 +12,22 @@ import {
   type BackupPayload
 } from '$lib/utils/db'
 
-/** 备份集合键名 */
-export const BACKUP_KEYS = ['buildings', 'devices', 'points', 'verdicts', 'rectifies'] as const
+/** 备份集合键名（batches / importRows 为 v3 新增，旧备份文件可能缺失） */
+export const BACKUP_KEYS = ['buildings', 'devices', 'points', 'verdicts', 'rectifies', 'batches', 'importRows'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [buildings, devices, points, verdicts, rectifies] = await Promise.all([
+  const [buildings, devices, points, verdicts, rectifies, batches, importRows] = await Promise.all([
     db.buildings.toArray(),
     db.devices.toArray(),
     db.points.toArray(),
     db.verdicts.toArray(),
-    db.rectifies.toArray()
+    db.rectifies.toArray(),
+    db.batches.toArray(),
+    db.importRows.toArray()
   ])
   return {
     app: 'gblightprot',
@@ -35,7 +37,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     devices,
     points,
     verdicts,
-    rectifies
+    rectifies,
+    batches,
+    importRows
   }
 }
 
@@ -49,8 +53,12 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== undefined && obj.app !== 'gblightprot') {
     errors.push('app 字段应为 gblightprot，文件来源不明')
   }
-  for (const key of BACKUP_KEYS) {
+  // 五张基础表必须存在；批次两表为 v3 新增，旧文件缺失时按空数组兼容
+  for (const key of ['buildings', 'devices', 'points', 'verdicts', 'rectifies'] as const) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
+  }
+  for (const key of ['batches', 'importRows'] as const) {
+    if (obj[key] !== undefined && !Array.isArray(obj[key])) errors.push(`${key} 字段不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
   const payload: BackupPayload = {
@@ -61,7 +69,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     devices: obj.devices ?? [],
     points: obj.points ?? [],
     verdicts: obj.verdicts ?? [],
-    rectifies: obj.rectifies ?? []
+    rectifies: obj.rectifies ?? [],
+    batches: obj.batches ?? [],
+    importRows: obj.importRows ?? []
   }
   return { ok: true, errors, payload }
 }
@@ -73,7 +83,9 @@ export function countPayload(payload: BackupPayload): CountMap {
     devices: payload.devices.length,
     points: payload.points.length,
     verdicts: payload.verdicts.length,
-    rectifies: payload.rectifies.length
+    rectifies: payload.rectifies.length,
+    batches: payload.batches.length,
+    importRows: payload.importRows.length
   }
 }
 
@@ -109,13 +121,19 @@ export function readFileText(file: File): Promise<string> {
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.buildings, db.devices, db.points, db.verdicts, db.rectifies], async () => {
-    await db.buildings.bulkPut(payload.buildings)
-    await db.devices.bulkPut(payload.devices)
-    await db.points.bulkPut(payload.points)
-    await db.verdicts.bulkPut(payload.verdicts)
-    await db.rectifies.bulkPut(payload.rectifies)
-  })
+  await db.transaction(
+    'rw',
+    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies, db.batches, db.importRows],
+    async () => {
+      await db.buildings.bulkPut(payload.buildings)
+      await db.devices.bulkPut(payload.devices)
+      await db.points.bulkPut(payload.points)
+      await db.verdicts.bulkPut(payload.verdicts)
+      await db.rectifies.bulkPut(payload.rectifies)
+      await db.batches.bulkPut(payload.batches)
+      await db.importRows.bulkPut(payload.importRows)
+    }
+  )
   return countPayload(payload)
 }
 
@@ -124,6 +142,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const buildingMap = new Map<string, string>()
   const deviceMap = new Map<string, string>()
   const pointMap = new Map<string, string>()
+  const batchMap = new Map<string, string>()
+  const suffix = `IMP${Date.now().toString(36).slice(-4)}`
 
   const buildings = payload.buildings.map((building) => {
     const id = createId('bld')
@@ -135,10 +155,26 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     deviceMap.set(device.id, id)
     return { ...device, id, buildingId: buildingMap.get(device.buildingId) ?? device.buildingId }
   })
+  // 批次重新分配 id 并给批次号加迁移后缀，避免与库内已有批次号冲突
+  const batches = payload.batches.map((batch) => {
+    const id = createId('bat')
+    batchMap.set(batch.id, id)
+    return {
+      ...batch,
+      id,
+      batchNo: `${batch.batchNo}-${suffix}`,
+      buildingId: batch.buildingId ? buildingMap.get(batch.buildingId) ?? batch.buildingId : batch.buildingId
+    }
+  })
   const points = payload.points.map((point) => {
     const id = createId('pnt')
     pointMap.set(point.id, id)
-    return { ...point, id, deviceId: deviceMap.get(point.deviceId) ?? point.deviceId }
+    return {
+      ...point,
+      id,
+      deviceId: deviceMap.get(point.deviceId) ?? point.deviceId,
+      batchId: point.batchId ? batchMap.get(point.batchId) ?? point.batchId : null
+    }
   })
   const verdicts = payload.verdicts.map((verdict) => ({
     ...verdict,
@@ -151,7 +187,13 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     buildingId: buildingMap.get(rectify.buildingId) ?? rectify.buildingId,
     pointId: rectify.pointId ? pointMap.get(rectify.pointId) ?? rectify.pointId : null
   }))
-  return { ...payload, buildings, devices, points, verdicts, rectifies }
+  const importRows = payload.importRows.map((row) => ({
+    ...row,
+    id: createId('row'),
+    batchId: batchMap.get(row.batchId) ?? row.batchId,
+    pointId: row.pointId ? pointMap.get(row.pointId) ?? row.pointId : null
+  }))
+  return { ...payload, buildings, devices, points, verdicts, rectifies, batches, importRows }
 }
 
 /** 检测结论行：按建筑物汇总测点数、不合格数与结论文字 */

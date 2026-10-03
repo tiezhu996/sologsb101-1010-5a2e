@@ -30,8 +30,19 @@
   } from '$lib/utils/export.ts'
   import type { ConclusionLine, CountMap } from '$lib/utils/export.ts'
   import { RECTIFY_STATES } from '$lib/types/rectify.ts'
+  import { useRouter } from '$lib/utils/router.ts'
 
-  const EMPTY_COUNTS: CountMap = { buildings: 0, devices: 0, points: 0, verdicts: 0, rectifies: 0 }
+  const { push } = useRouter()
+
+  const EMPTY_COUNTS: CountMap = {
+    buildings: 0,
+    devices: 0,
+    points: 0,
+    verdicts: 0,
+    rectifies: 0,
+    batches: 0,
+    importRows: 0
+  }
 
   let counts = $state<CountMap>(EMPTY_COUNTS)
   let lastBackupAt = $state<string | null>(null)
@@ -296,6 +307,14 @@
           <td>{lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}</td>
         </tr>
         <tr>
+          <th>导入批次 / 批次行</th>
+          <td class="gb-mono">{counts.batches} / {counts.importRows}</td>
+          <th>批次对账入口</th>
+          <td>
+            <button class="link" type="button" onclick={() => push('/batches')}>前往批次对账页 →</button>
+          </td>
+        </tr>
+        <tr>
           <th>状态分布</th>
           <td colspan="3">
             {#each RECTIFY_STATES as state (state)}
@@ -348,5 +367,14 @@
 
   tr.is-bad td {
     background: #fff6f4;
+  }
+
+  .link {
+    border: none;
+    background: transparent;
+    color: #1d3557;
+    text-decoration: underline;
+    cursor: pointer;
+    font-size: 12px;
   }
 </style>

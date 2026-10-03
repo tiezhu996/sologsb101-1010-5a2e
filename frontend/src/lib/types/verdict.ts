@@ -16,8 +16,10 @@ export interface Verdict {
   inspector: string
   /** 判定日期 */
   verdictDate: string
-  /** 是否已由检测人确认生效 */
+  /** 是否已由检测人确认生效（已确认的判定不会被批次导入的实测值覆盖） */
   confirmed: boolean
+  /** 判定当时所用限值快照（Ω）：确认后不再随测点限值变化，保证结论可追溯 */
+  limitOhm: number
   createdAt: number
   updatedAt: number
 }
